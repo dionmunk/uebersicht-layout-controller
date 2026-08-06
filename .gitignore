@@ -1,0 +1,11 @@
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+.Spotlight-V100
+.Trashes
+thumbs.db
+Thumbs.db
+
+# Saved positions live at ~/.config/ubersicht/layout.json, deliberately outside the
+# widget folder (Übersicht watches this one), so there is nothing here to ignore.

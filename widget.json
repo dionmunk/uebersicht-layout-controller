@@ -1,0 +1,6 @@
+{
+  "name": "Layout Controller",
+  "description": "Move Übersicht widgets around the desktop like windows and keep them where you put them, with snap-to-grid column packing and per-screen persistence.",
+  "author": "Dion Munk",
+  "email": "dion@dionmunk.com"
+}
