@@ -14,11 +14,15 @@
 # The grid is the one described in LAYOUT.md:
 #   - Horizontally a drop snaps to the nearest column (330px pitch from a 10px
 #     origin). Widget widths are fixed, so this is exact.
-#   - Vertically nothing snaps to a lattice. The column is re-packed top to bottom
-#     from each widget's real measured height plus a 10px gap, which is LAYOUT.md's
-#     actual vertical model. A row lattice cannot express this layout: the top-lists
-#     render ~122px and github ~102px, neither a multiple of UNIT, which is why
-#     five of column 1's nine widgets sit off the 90px pitch.
+#   - Vertically nothing snaps to a lattice. The column is re-packed from each widget's
+#     real measured height plus a 10px gap, which is LAYOUT.md's actual vertical model.
+#     A row lattice cannot express this layout: the top-lists render ~122px and github
+#     ~102px, neither a multiple of UNIT, which is why five of column 1's nine widgets
+#     sit off the 90px pitch.
+#   - Each widget stacks from the screen edge it was dropped nearest, so one column can
+#     hold a group grown down from the top and another grown up from the bottom. Drop a
+#     widget low and it stays pinned low as its neighbours change height. The anchor is
+#     decided once at drop and remembered; see pack.
 #
 # State lives at ~/.config/ubersicht/layout.json, deliberately OUTSIDE the widget
 # folder. Übersicht watches that folder, so writing there would reload every widget
@@ -55,6 +59,14 @@
 #                             wider than what gets painted, or when the widget is
 #                             still empty the first time it is measured; otherwise the
 #                             span is derived from the measured width.
+#   data-layout-anchor="bottom"
+#                             Stack me up from the bottom of the screen rather than
+#                             down from the top, until the user drags me somewhere.
+#                             This is for a widget written to sit at the foot of the
+#                             screen: it can now say so and still be managed, instead
+#                             of having to opt out with data-layout-manual. Only ever a
+#                             default. Once the widget has been dropped, where it was
+#                             dropped wins, and this is ignored.
 #
 # A widget can READ the grid, via CSS custom properties this controller publishes on
 # :root (see publishTokens). Always with a fallback, so the widget still works if this
@@ -99,9 +111,14 @@ snap: 'column'   # 'column' | 'free'
 # Widgets that place themselves and must never be packed. Prefer `data-layout-manual`
 # on the widget's own root element (see the header); this list is for widgets that
 # cannot be edited. Entries are matched as id prefixes, so music.widget is 'music'.
-# music is pinned bottom-left by its own CSS; theme-controller renders nothing; this
-# widget is its own pill in the corner.
-offGrid: ['music', 'theme-controller', 'layout-controller']
+#
+# theme-controller renders nothing, and this widget is its own pill in the corner: both
+# are control surfaces rather than dashboard content, so neither wants a grid slot.
+#
+# music used to be listed here too, because it pins itself bottom-left and packing only
+# ever grew columns downward from the top. Anchoring removed that reason: it now
+# declares data-layout-anchor="bottom" and is managed like anything else.
+offGrid: ['theme-controller', 'layout-controller']
 
 style: """
   bottom 10px
@@ -319,7 +336,7 @@ render: -> """
       <div class="lc-help">
         <div class="lc-help-row">
           <span class="lc-key">Drag</span>
-          <span>Moves a widget. Snap to grid drops it into the nearest column and re-stacks that column with even gaps. Freeform leaves it exactly where you let go.</span>
+          <span>Moves a widget. Snap to grid drops it into the nearest column and re-stacks that column with even gaps, stacking from whichever screen edge you dropped it nearest. Freeform leaves it exactly where you let go.</span>
         </div>
         <div class="lc-help-row">
           <span class="lc-key">⌥ Drag</span>
@@ -327,7 +344,7 @@ render: -> """
         </div>
         <div class="lc-help-row">
           <span class="lc-key">Pack</span>
-          <span>Re-stacks every column from the top down, closing any uneven gaps.</span>
+          <span>Re-stacks every column, closing any uneven gaps. Each widget keeps the edge it was dropped nearest.</span>
         </div>
         <div class="lc-help-row">
           <span class="lc-key">Reset</span>
@@ -404,42 +421,124 @@ boxes: ->
   out = []
   for el in @widgetEls()
     r = el.getBoundingClientRect()
+    key = @keyOf(el)
     out.push
-      key:    @keyOf(el)
+      key:    key
       col:    @columnOf(r.left)
       span:   @spanOf(r.width, el)
       top:    r.top
       height: r.height
+      # Remembered or declared, never measured. A widget's anchor is decided once when
+      # it is dropped and carried from there on, so re-packing can never flip it.
+      anchor: @anchorOf(key, el)
   out
 
-# Re-stack top to bottom, every widget sitting GAP below the one above it. This is
-# LAYOUT.md's formula, top = EDGE + Σ (max(UNIT, realHeight) + GAP), which is why gaps
-# stay exact no matter what a widget's content does to its height.
+# Re-stack a column so every widget sits GAP from its neighbour. This is LAYOUT.md's
+# formula, top = EDGE + Σ (max(UNIT, realHeight) + GAP), which is why gaps stay exact
+# no matter what a widget's content does to its height.
 #
-# Greedy, in current top order, tracking the next free y per column. A widget spanning
-# more than one column has to clear every column it covers and then advance all of
-# them: otherwise github on its two-column `year` span and a single-column widget
-# would both be placed into the same space.
+# Each widget stacks from the edge it was dropped nearest, so a column can hold a group
+# grown down from the top and another grown up from the bottom. That is what lets a
+# widget pinned to the bottom of the screen stay pinned while still being managed, the
+# thing that previously forced music and visualizer to opt out with layoutMode
+# "manual". Each column therefore tracks two frontiers rather than one: nextY growing
+# down from the top edge, nextUp growing up from the bottom.
+#
+# The anchor is remembered, never re-derived from the packed result. Deriving it would
+# oscillate: packing moves a widget, moving it can change which edge it is nearest,
+# and that would change where the next pack puts it. See anchorAt, which decides it
+# once at drop time.
+#
+# Greedy, in current order within each group. A widget spanning more than one column
+# has to clear every column it covers and then advance all of them: otherwise github on
+# its two-column `year` span and a single-column widget would both be placed into the
+# same space.
 pack: (boxes) ->
   out = {}
-  nextY = {}
+  nextY = {}                                          # frontier growing down
+  nextUp = {}                                         # frontier growing up
+  floor = window.innerHeight - @grid.origin
   freeAt = (c) => nextY[c] ? @grid.origin
-  ordered = boxes.slice().sort (a, b) -> (a.top - b.top) or (a.col - b.col)
-  for b in ordered
+  freeUp = (c) => nextUp[c] ? floor
+
+  place = (b, anchor) =>
     span = Math.max 1, (b.span ? 1)
-    top = @grid.origin
-    for c in [b.col...(b.col + span)]
-      top = Math.max top, freeAt(c)
-    out[b.key] =
-      left: @leftOf(b.col)
-      top:  top
+    cols = [b.col...(b.col + span)]
     # Round the height before accumulating. The top-lists measure 122.23px, and left
-    # raw that fraction compounds down the column (0.23 → 0.47 → 0.70), so a pack
+    # raw that fraction compounds along the column (0.23 → 0.47 → 0.70), so a pack
     # would nudge widgets a pixel even when nothing had actually moved. Rounding
     # first makes packing an exact no-op on an already-tidy column.
-    advance = top + Math.max(@grid.unit, Math.round(b.height)) + @grid.gap
-    nextY[c] = advance for c in [b.col...(b.col + span)]
+    h = Math.max @grid.unit, Math.round(b.height)
+
+    # A column holding more than fits is the one case the two groups meet. The upward
+    # group gives way: a widget that would have crossed the downward frontier is placed
+    # against it instead and from then on counts as part of that stack, so a full column
+    # degrades into one continuous top-down run rather than into overlapping widgets.
+    crossed = false
+    if anchor is 'bottom'
+      bottom = floor
+      bottom = Math.min bottom, freeUp(c) for c in cols
+      top = bottom - h
+      for c in cols
+        if freeAt(c) > top
+          top = freeAt(c)
+          crossed = true
+    else
+      top = @grid.origin
+      top = Math.max top, freeAt(c) for c in cols
+
+    out[b.key] =
+      left:   @leftOf(b.col)
+      top:    top
+      anchor: anchor
+    # Advance only the frontier this widget actually stacked from. Advancing both would
+    # push the downward frontier to the floor the moment anything was placed at the
+    # bottom, and every later bottom widget would then be clamped down against it.
+    for c in cols
+      if anchor is 'bottom' and not crossed
+        nextUp[c] = Math.min freeUp(c), top - @grid.gap
+      else
+        nextY[c] = Math.max freeAt(c), top + h + @grid.gap
+    return
+
+  # Top group first, in current top order, so the bottom group has something to clamp
+  # against. The bottom group runs lowest-first, so the widget nearest the bottom edge
+  # stays nearest it.
+  byTop = (a, b) -> (a.top - b.top) or (a.col - b.col)
+  byBottom = (a, b) -> ((b.top + b.height) - (a.top + a.height)) or (a.col - b.col)
+  grouped = {top: [], bottom: []}
+  grouped[if b.anchor is 'bottom' then 'bottom' else 'top'].push b for b in boxes
+  place b, 'top' for b in grouped.top.sort byTop
+  place b, 'bottom' for b in grouped.bottom.sort byBottom
   out
+
+# Which edge a widget dropped at this position should stack from: whichever of its own
+# edges is nearer the matching screen edge. Written that way because that is how it
+# reads as a rule, though the origin cancels and it reduces exactly to asking whether
+# the widget's centre is below the middle of the screen. So a tall widget counts as
+# bottom-anchored only once more than half of it is past halfway, which is the
+# behaviour you want when dragging something the height of a column.
+anchorAt: (top, height) ->
+  fromTop = top - @grid.origin
+  fromBottom = (window.innerHeight - @grid.origin) - (top + height)
+  if fromBottom < fromTop then 'bottom' else 'top'
+
+# The anchor a widget should stack from, in order of authority:
+#
+#   1. what it was last dropped as, which always wins once the user has moved it
+#   2. what the widget itself asks for, via data-layout-anchor
+#   3. the top, which is what this controller did for every widget previously
+#
+# Step 2 is what lets a widget that pins itself to the bottom of the screen be managed
+# without first having to be dragged there: it declares the edge it was written for and
+# lands on it immediately. The declaration is only ever a default. Dragging it writes a
+# remembered anchor, and from then on step 1 shadows it, so the user's placement is
+# never overridden by the widget's own opinion.
+anchorOf: (key, el = null) ->
+  saved = @saved?[key]?.anchor
+  return 'bottom' if saved is 'bottom'
+  return 'top' if saved is 'top'
+  if el?.getAttribute?('data-layout-anchor') is 'bottom' then 'bottom' else 'top'
 
 # --- the override stylesheet -------------------------------------------------
 
@@ -938,6 +1037,9 @@ onUp: (ev) ->
     next[d.key] =
       left: Math.round d.left
       top:  Math.round d.top
+      # Recorded even though nothing packs here, so that switching to Snap to grid or
+      # hitting Pack later stacks it from the edge it was actually left near.
+      anchor: @anchorAt d.top, d.height
     @saved = next
   else
     # Snap to the column and re-pack around it.
@@ -945,13 +1047,17 @@ onUp: (ev) ->
   @writeRules @saved
   @persist()
 
-# The dragged widget as a box, at the column, span and height it would land with.
+# The dragged widget as a box, at the column, span, height and anchor it would land
+# with. The anchor comes from where the pointer currently has it rather than from what
+# it was remembered by, so dragging a widget from the top of the screen to the bottom
+# re-anchors it, and the preview during the drag already shows where it will settle.
 projected: ->
   key:    @drag.key
   col:    @columnOf @drag.left
   span:   @drag.span
   top:    @drag.top
   height: @drag.height
+  anchor: @anchorAt @drag.top, @drag.height
 
 # --- lifecycle ---------------------------------------------------------------
 

@@ -46,7 +46,7 @@ If you have a widget of your own parked in that corner, the pill sits above it a
 | **Move** | Bottom-right corner of the screen. Unlocks the desktop and opens the move window. The corner pill hides while unlocked, so there is only ever one place to click Done |
 | **Drag** | Moves a widget |
 | **⌥ Drag** | Borrows the other placement mode for that one drag |
-| **Pack** | Re-stacks every column from the top down, closing uneven gaps |
+| **Pack** | Re-stacks every column, closing uneven gaps. Each widget keeps the screen edge it was dropped nearest |
 | **Reset** | Returns every widget to the position set in its own file, undoing everything |
 | **Done** | Locks the desktop again |
 
@@ -57,7 +57,7 @@ way of whatever you are arranging.
 
 | Mode | Behaviour |
 |---|---|
-| **Snap to grid** (default) | A drop snaps to the nearest column and re-packs that column top to bottom with even gaps |
+| **Snap to grid** (default) | A drop snaps to the nearest column and re-packs that column with even gaps |
 | **Freeform** | The widget stays exactly where you let go, and nothing else moves |
 
 The choice is remembered per screen, and holding **Option** during a drag borrows the
@@ -68,6 +68,24 @@ Horizontal snapping is exact, because widget widths are fixed: columns sit on a
 re-packed from each widget's *real measured height* plus a 10px gap, because a row
 lattice cannot express a real desktop: top-lists render about 122px and a
 contributions graph about 102px, neither a multiple of the 80px base unit.
+
+### Anchoring
+
+A widget stacks from the screen edge it was dropped nearest, so one column can hold a
+group grown down from the top and another grown up from the bottom. Drop a widget low
+and it stays low as its neighbours change height, which is what lets something written
+to sit at the foot of the screen be managed at all instead of opting out.
+
+The anchor is decided once, when you drop the widget, and remembered from then on. It
+is deliberately not re-derived from where a widget ends up: packing moves widgets, and
+moving one can change which edge it is nearest, so a derived anchor would never settle.
+
+A widget can also declare a starting anchor with `data-layout-anchor` (below), which
+covers the case where it has never been dragged. Dragging always wins over that.
+
+When a column holds more than fits, the upward group gives way: a widget that would
+cross the downward stack is placed against it instead, so the column degrades into one
+continuous top-down run rather than into overlapping widgets.
 
 ## The grid
 
@@ -81,8 +99,10 @@ The default grid matches the one this widget's companion collection uses:
 | `UNIT` | `80px` | Minimum widget height, one row |
 
 Column left positions are `EDGE + col · (COL + GAP)`, so 10 / 340 / 670 / 1000 and so
-on. Vertical placement is `top(row) = EDGE + Σ (max(UNIT, realHeight) + GAP)` for
-every row above. Retune all of it in the `grid` option at the top of `index.coffee`.
+on. Vertical placement accumulates `max(UNIT, realHeight) + GAP` from the widget's
+anchor: `EDGE + Σ …` from the top for a top-anchored widget, and the mirror of that up
+from `screenHeight - EDGE` for a bottom-anchored one. Retune all of it in the `grid`
+option at the top of `index.coffee`.
 
 ## For other widget authors
 
@@ -97,12 +117,22 @@ Attributes on your widget's root element:
 |---|---|
 | `data-layout-manual` | Never manage me. This is how a widget declares that it positions itself, pinned to a corner or centred |
 | `data-layout-span="2"` | I occupy 2 columns. Only needed when the footprint is wider than what gets painted, or when the widget is still empty the first time it is measured. Otherwise the span is derived from the measured width |
+| `data-layout-anchor="bottom"` | Stack me up from the bottom of the screen rather than down from the top. For a widget written to sit at the foot of the screen: it can say so and still be managed, instead of opting out with `data-layout-manual`. Only a default, and ignored once the widget has been dragged |
 
 Set them in `afterRender`:
 
 ```coffee
 afterRender: (domEl) ->
   domEl.setAttribute('data-layout-manual', '')
+```
+
+Set an anchor the same way, from whatever option your widget already uses for its own
+placement, so the two never disagree:
+
+```coffee
+afterRender: (domEl) ->
+  domEl.setAttribute 'data-layout-anchor',
+    if options.verticalPosition is 'bottom' then 'bottom' else 'top'
 ```
 
 ### Reading the grid from your widget
@@ -165,7 +195,7 @@ At the top of [`index.coffee`](layout-controller.widget/index.coffee):
 | `widgetEnabled` | `true` | Turn the whole widget off |
 | `grid` | `{ origin: 10, colPitch: 330, gap: 10, unit: 80 }` | The desktop grid |
 | `snap` | `'column'` | Starting placement mode for a screen that has never been set. The window's toggle owns it after that |
-| `offGrid` | `['music', 'theme-controller', 'layout-controller']` | Widgets that place themselves and must never be packed. Matched as id prefixes. Prefer `data-layout-manual` on the widget itself; this list is for widgets you cannot edit |
+| `offGrid` | `['theme-controller', 'layout-controller']` | Widgets that place themselves and must never be packed. Matched as id prefixes. Prefer `data-layout-manual` on the widget itself; this list is for widgets you cannot edit. Both defaults are control surfaces rather than dashboard content |
 
 ## Companion widgets
 
