@@ -39,6 +39,23 @@
 # just that one slice, behind a lock, so two screens cannot erase each other. Version 1
 # files (a single flat position map) are migrated on read.
 #
+# A saved position is an absolute pixel pair, so it only means anything next to the
+# screen size it was packed against, and that size changes under it: plug in a display,
+# change resolution, close the lid. Nothing about a stored top is relative to the
+# bottom edge, so a widget anchored there simply stays at the old floor and strands
+# itself mid-screen when the desktop grows. Each slice therefore records the viewport
+# it was packed for, and a mismatch re-packs (see reflow). That is checked on a resize,
+# which is what an existing page gets when its window is re-framed, and again on load,
+# because a page built for a screen *after* the change never sees a resize at all. A
+# slice that predates the recorded size is judged on the measured layout instead, so a
+# slice with no recorded size is left alone rather than guessed at. A widget rendering
+# nothing at the time still moves with the rest, because each saved position remembers
+# the height it was packed at and so can be placed without measuring; see boxes.
+#
+# Every automatic re-pack waits for the desktop to stop filling in first. Packing around
+# a widget whose shell command has not finished yet reorders its column; see
+# reflowWhenSettled.
+#
 # Requires jq for saving, which ships with macOS. Without it the widget still drags and
 # packs, it just cannot persist; nothing is corrupted.
 #
@@ -392,12 +409,26 @@ spanOf: (width, el = null) ->
   Math.max 1, Math.round((width + @grid.gap) / @grid.colPitch)
 
 # Nearest column for an x position, and that column's left edge.
-columnOf: (x) -> Math.max 0, Math.round((x - @grid.origin) / @grid.colPitch)
+#
+# Clamped to the columns that actually fit, so a widget cannot be left hanging off the
+# right edge of a screen narrower than the one it was placed on. A widget wider than the
+# whole screen clamps to column 0, which at least keeps its left edge reachable.
+columnOf: (x, span = 1) ->
+  last = Math.max 0, @columnCount() - span
+  Math.min last, Math.max(0, Math.round((x - @grid.origin) / @grid.colPitch))
 leftOf: (col) -> @grid.origin + col * @grid.colPitch
 
 # How many whole columns fit on this screen: origin + n·colPitch - gap ≤ width - origin.
 columnCount: ->
   Math.max 1, Math.floor((window.innerWidth - 2 * @grid.origin + @grid.gap) / @grid.colPitch)
+
+# The screen this page is currently laid out on. Saved alongside the positions, since
+# absolute pixels are only meaningful against the size they were packed for.
+viewport: -> width: window.innerWidth, height: window.innerHeight
+
+# Compared field by field rather than by identity: these come back from JSON, so two
+# readings of the same screen are never the same object.
+sameViewport: (a, b) -> !!a and !!b and a.width is b.width and a.height is b.height
 
 # Every widget this controller manages.
 #
@@ -417,20 +448,46 @@ widgetEls: ->
 
 # Measure the current layout. Heights come from the DOM rather than LAYOUT.md's
 # hand-measured figures, so a content change can never leave the packing stale.
-boxes: ->
+# `ghosts` also returns the widgets that are not currently measurable but do have a
+# remembered height, placed at the slot they last occupied. A widget that renders nothing
+# is invisible to a pack, so without this the widgets below it take its space: music
+# hides itself whenever nothing is playing, and would come back to find the visualizer
+# had claimed the foot of the column. Holding the slot also means the two do not trade
+# places every time a track starts or stops.
+#
+# Off by default, so the Pack button still reclaims the space a hidden widget is holding.
+# That is the deliberate act, and it is the way out if a widget is switched off for good.
+boxes: (ghosts = false) ->
   out = []
+  filled = {}
   for el in @widgetEls()
     r = el.getBoundingClientRect()
     key = @keyOf(el)
+    # Span first: how many columns a widget covers decides how far right it is allowed
+    # to sit, so the clamp in columnOf needs it.
+    span = @spanOf(r.width, el)
+    filled[key] = true
     out.push
       key:    key
-      col:    @columnOf(r.left)
-      span:   @spanOf(r.width, el)
+      col:    @columnOf(r.left, span)
+      span:   span
       top:    r.top
       height: r.height
       # Remembered or declared, never measured. A widget's anchor is decided once when
       # it is dropped and carried from there on, so re-packing can never flip it.
       anchor: @anchorOf(key, el)
+  return out unless ghosts
+  # A saved entry only carries a height once it has been packed while visible, so a
+  # widget that has never rendered on this screen holds nothing and cannot leave a hole.
+  for key, p of (@saved ? {}) when not filled[key] and p.height
+    span = Math.max 1, (p.span ? 1)
+    out.push
+      key:    key
+      col:    @columnOf(p.left, span)
+      span:   span
+      top:    p.top
+      height: p.height
+      anchor: @anchorOf(key)
   out
 
 # Re-stack a column so every widget sits GAP from its neighbour. This is LAYOUT.md's
@@ -491,6 +548,11 @@ pack: (boxes) ->
       left:   @leftOf(b.col)
       top:    top
       anchor: anchor
+      # Carried so the widget can still be placed on a pass where it renders nothing.
+      # The measured height, not `h`: the UNIT floor is packing's business and applying
+      # it here as well would remember a single-row widget as taller than it is.
+      height: Math.round b.height
+      span:   span
     # Advance only the frontier this widget actually stacked from. Advancing both would
     # push the downward frontier to the floor the moment anything was placed at the
     # bottom, and every later bottom widget would then be clamped down against it.
@@ -684,6 +746,11 @@ slice: ->
   panel:     @panel ? null
   # Placement mode chosen on this screen, via the window's toggle.
   mode:      @placement()
+  # The screen size these positions were packed against. Absolute pixels mean nothing
+  # without it, and macOS reuses a screen id for whatever display connects next, so a
+  # slice can outlive the display it was written for. This is what the next page to load
+  # compares itself against to decide whether to re-pack.
+  viewport:  @viewport()
 
 persist: ->
   # Debounced, since several saves can land in the same tick, e.g. a burst of mutations
@@ -761,12 +828,150 @@ reset: ->
       rmdir "$L" 2>/dev/null
     """
 
+# Fold a fresh pack into the saved positions rather than replacing them.
+#
+# pack only ever returns the widgets it could measure, and widgetEls deliberately skips
+# anything rendering at zero height: a widget switched off for this screen, or one that
+# is simply empty at that moment (music with nothing playing). Replacing wholesale would
+# quietly drop the position such a widget had been given, and it would reappear at
+# whatever spot is compiled into its own source once it had something to show.
+merge: (a, b) ->
+  out = {}
+  out[k] = v for k, v of (a ? {})
+  out[k] = v for k, v of (b ? {})
+  out
+
 # Tidy every column from measured heights, without moving anything between columns.
 # This is the fix for drift, e.g. after a content change alters a widget's height.
 packAll: ->
-  @saved = @pack @boxes()
+  @saved = @merge @saved, @pack(@boxes())
   @writeRules @saved
   @persist()
+
+# Bring the layout back onto a screen that is no longer the size it was packed for.
+#
+# Snap to grid re-packs, which is exactly what the Pack button does: every top is
+# recomputed from the current floor, so bottom-anchored widgets find the new bottom edge
+# instead of hanging at the old one, and columns close up against the new width. Nothing
+# moves between columns, so the arrangement survives; only the gaps are redone.
+#
+# Freeform cannot re-pack without discarding an arrangement placed by hand, so there
+# each widget is carried by the change in height if it was dropped nearest the bottom,
+# keeping its distance from that edge, and left alone if it was dropped nearest the top.
+#
+# Packed with ghosts, so a widget that happens to be rendering nothing right now is still
+# moved onto the new screen along with everything else, rather than being left at a
+# position that belonged to a display no longer attached.
+reflow: (prev) ->
+  return unless @manages()
+  return if @isPreview()
+  @saved =
+    if @placement() is 'free'
+      @shift @saved, prev
+    else
+      @merge @saved, @pack(@boxes(true))
+  @writeRules @saved
+  @drawGuides()
+  @persist()
+
+# Whether this page is a browser preview rather than Übersicht's own desktop window.
+#
+# The same URL serves both: open http://127.0.0.1:41416/<screenId>/ in a browser and you
+# get the identical page, client bundle and screen id included, which is how these
+# widgets are worked on. The one thing that differs is the viewport, and the viewport is
+# what every automatic decision below keys off. Unguarded, a preview would decide the
+# screen had changed size, pack the desktop for a size no display has, and save that
+# over the real layout.
+#
+# So a preview shows the saved positions exactly as they are, which is what a preview is
+# for. Dragging and Pack still work, being deliberate acts.
+#
+# Two signals, either one enough. Übersicht's window is borderless with the web view
+# filling it, so its outer and inner sizes agree, while a browser has chrome above the
+# page and they do not. And WKWebView's user agent carries no Chrome or Firefox token.
+# Safari would slip through both, at the cost of one preview-only re-pack.
+isPreview: ->
+  return true if window.outerHeight > window.innerHeight
+  return true if window.outerWidth > window.innerWidth
+  /Chrome|Chromium|Firefox/.test(navigator?.userAgent ? '')
+
+# Freeform's answer to a screen-size change: translate rather than re-stack.
+#
+# `prev` is the viewport the positions were packed against. Without it (a slice written
+# before this was recorded) there is no delta to apply and this reduces to the clamp,
+# which is still worth doing: it is what pulls a widget back on screen when the new
+# display is the smaller one.
+shift: (positions, prev) ->
+  dy = if prev?.height then window.innerHeight - prev.height else 0
+  out = {}
+  for key, p of (positions ? {})
+    r = document.getElementById(key)?.getBoundingClientRect()
+    w = r?.width ? (@grid.colPitch - @grid.gap)
+    h = r?.height ? @grid.unit
+    top = p.top + (if p.anchor is 'bottom' then dy else 0)
+    out[key] =
+      left:   Math.max(0, Math.min(p.left, window.innerWidth - @grid.origin - w))
+      top:    Math.max(0, Math.min(top, window.innerHeight - @grid.origin - h))
+      anchor: p.anchor
+      # Preserved rather than re-measured: a widget hidden right now still has to keep
+      # what it last measured, which is the whole point of remembering it.
+      height: p.height
+      span:   p.span
+  out
+
+# Übersicht re-frames the window it already has when a screen changes size, so for a
+# page that is open at the time this arrives as a plain resize.
+#
+# Debounced, and only acted on when the size genuinely ends up different: AppKit resizes
+# in several steps, and packing against the intermediate sizes would just shuffle
+# everything around on the way to the one that matters.
+watchForResize: ->
+  return if @_resizeBound
+  @_resizeBound = true
+  window.addEventListener 'resize', =>
+    clearTimeout @_resizeTimer
+    @_resizeTimer = setTimeout (=>
+      prev = @_viewport
+      now  = @viewport()
+      return if @sameViewport prev, now
+      @_viewport = now
+      # --grid-columns is derived from the width, so widgets reading the grid see the
+      # new one whether or not there is anything here to re-pack.
+      @publishTokens()
+      # A window left open across the change would otherwise keep a position that is
+      # now off the edge of a smaller screen.
+      @positionWindow @_domEl if @unlocked
+      # Settled rather than immediate: a screen change can bring widgets with it, when
+      # the display that just arrived becomes the main one and Übersicht moves every
+      # main-screen-only widget onto this page.
+      @reflowWhenSettled prev
+    ), 400
+
+# Run an automatic re-pack, but only once the desktop has stopped filling in.
+#
+# Widgets arrive one at a time as their shell commands finish, over several seconds on a
+# cold start. Packing a half-rendered desktop is destructive rather than merely early: a
+# column's order is derived from the tops pack can measure, and a widget that has not
+# arrived yet holds no place, so the ones below it are hoisted above where it belongs.
+# Do that repeatedly as the rest trickle in and a column comes back thoroughly shuffled.
+# Column 2 landing as stocks, news, weather is exactly that, and it is why nothing here
+# re-packs on a widget appearing.
+#
+# Settled means the count came back the same twice running. A widget that never renders
+# at all cannot be waited for, so it is packed around, which is the one case this does
+# not cover.
+reflowWhenSettled: (prev) ->
+  clearTimeout @_settleTimer
+  last = -1
+  tick = =>
+    now = @widgetEls().length
+    if now > 0 and now is last
+      @reflow prev
+    else
+      last = now
+      @_settleTimer = setTimeout tick, 1200
+  @_settleTimer = setTimeout tick, 1200
+  return
 
 # --- new widgets -------------------------------------------------------------
 
@@ -1040,6 +1245,8 @@ onUp: (ev) ->
       # Recorded even though nothing packs here, so that switching to Snap to grid or
       # hitting Pack later stacks it from the edge it was actually left near.
       anchor: @anchorAt d.top, d.height
+      height: Math.round d.height
+      span:   d.span
     @saved = next
   else
     # Snap to the column and re-pack around it.
@@ -1053,7 +1260,7 @@ onUp: (ev) ->
 # re-anchors it, and the preview during the drag already shows where it will settle.
 projected: ->
   key:    @drag.key
-  col:    @columnOf @drag.left
+  col:    @columnOf @drag.left, @drag.span
   span:   @drag.span
   top:    @drag.top
   height: @drag.height
@@ -1086,6 +1293,18 @@ update: (output, domEl) ->
     # desktop rather than trusting a list that predates per-screen tracking.
     @saved = parsed.positions ? parsed
     @seen  = []
+  # Did this page load onto a screen that is not the one those positions were packed
+  # for? Übersicht builds a fresh page per screen as displays come and go, so a page that
+  # appears *after* a screen change never sees a resize event and has only this to go on.
+  #
+  # A recorded viewport is the only thing that triggers this. `slice` is undefined on the
+  # version 1 path above, and a slice written before the viewport was recorded has none:
+  # both mean there is nothing to compare against, so nothing is re-packed. Guessing from
+  # the measured layout instead was worse than doing nothing, because the guess has to be
+  # made before it can be known whether every widget has rendered.
+  @_viewport    = @viewport()
+  @_reflowFrom  = slice?.viewport
+  @_needsReflow = @_reflowFrom? and not @sameViewport(@_reflowFrom, @_viewport)
   @publishTokens()
   # Set before bindControls, since the window drag reads it to find the window.
   @_domEl = domEl
@@ -1095,11 +1314,20 @@ update: (output, domEl) ->
   @bindControls domEl
   @bindDrag()
   @watchForNewWidgets()
+  @watchForResize()
   # Deferred: other widgets may well not have rendered when this controller updates,
   # so both the new-widget scan and the has-anything-to-manage check have to wait.
   @_domEl = domEl
   clearTimeout @_initialScan
   @_initialScan = setTimeout (=>
+    if @_needsReflow
+      prev = @_reflowFrom
+      @_needsReflow = false
+      @_reflowFrom = null
+      # Waits for the desktop to stop filling in, which on a cold start is well after
+      # this scan. placeNewWidgets below is unaffected: a widget it centres is one this
+      # screen has never seen, so no saved position exists for a re-pack to disturb.
+      @reflowWhenSettled prev
     @placeNewWidgets()
     @syncVisibility @_domEl
   ), 1500

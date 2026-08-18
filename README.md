@@ -186,6 +186,31 @@ shown on two screens usually wants a different spot on each. Saves are a `jq`
 read-modify-write of just that one slice, behind a lock, so two screens cannot erase
 each other. Version 1 files, a single flat position map, are migrated on read.
 
+**A slice is re-packed when the screen it was packed for changes size.** A saved position
+is an absolute pixel pair, so it means nothing without the screen it was measured against,
+and that changes under it: plug in a display, change resolution, close the lid. Nothing
+stored is relative to the bottom edge, so a bottom-anchored widget would simply stay at
+the old floor and strand itself mid-screen when the desktop grows. Each slice records the
+viewport it was packed for, and a mismatch re-packs. That is checked on a resize, which is
+what an existing page gets when its window is re-framed, and again on load, because a page
+built for a screen *after* the change never sees a resize at all. A slice written before
+the viewport was recorded has nothing to compare against and is left alone rather than
+guessed at.
+
+**A widget that renders nothing keeps its slot.** A hidden widget is invisible to a pack,
+so without this the ones below it take its space: the Music widget hides itself whenever
+nothing is playing, and would come back to find its neighbour had claimed the foot of the
+column. Each saved position remembers the height it was packed at, so a widget can be
+placed again without being measured, and a pair does not trade places every time a track
+starts or stops. **Pack** ignores this and reclaims the space, which is the way out when a
+widget is switched off for good.
+
+**Automatic re-packs wait for the desktop to stop filling in.** Widgets arrive one at a
+time as their shell commands finish, over several seconds on a cold start. Packing a
+half-rendered desktop is destructive rather than merely early, since a column's order
+comes from the tops it can measure and a widget that has not arrived holds no place. The
+re-pack waits until the widget count comes back the same twice running.
+
 ## Options
 
 At the top of [`index.coffee`](layout-controller.widget/index.coffee):
