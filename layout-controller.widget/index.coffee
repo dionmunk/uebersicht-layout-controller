@@ -395,9 +395,24 @@ keyOf: (el) -> el.id
 # 'music' would also claim a hypothetical music-visualizer.
 isOffGrid: (el) ->
   return true if el.hasAttribute? 'data-layout-manual'
+  @isOffGridId el.id
+
+# The `offGrid` half of the test, applied to a bare id. Needed for the saved positions
+# and the expected roster, which are lists of ids and may name a widget that is not in
+# the DOM right now.
+isOffGridId: (id) ->
   for name in @offGrid
-    return true if el.id is name or el.id.indexOf("#{name}-") is 0
+    return true if id is name or id.indexOf("#{name}-") is 0
   false
+
+# Whether a saved position belongs to a widget that opts out of being managed. Prefers
+# the live element, so a widget that has since declared data-layout-manual stops being
+# placed even though a position for it is still on file, and falls back to the id list
+# when it is not currently in the DOM.
+savedIsOffGrid: (key) ->
+  el = document.getElementById key
+  return @isOffGrid el if el
+  @isOffGridId key
 
 # How many columns a widget occupies. Derived from its measured width so nothing has
 # to be declared: 320px is one column, 650px is two. `data-layout-span` on the root
@@ -477,16 +492,31 @@ boxes: (ghosts = false) ->
       # it is dropped and carried from there on, so re-packing can never flip it.
       anchor: @anchorOf(key, el)
   return out unless ghosts
-  # A saved entry only carries a height once it has been packed while visible, so a
-  # widget that has never rendered on this screen holds nothing and cannot leave a hole.
-  for key, p of (@saved ? {}) when not filled[key] and p.height
+  # Every saved position becomes a ghost, whether or not a height was ever recorded
+  # against it. A position only gets written for a widget that rendered at least once
+  # (both writers, placeNewWidgets and a drop, measure the element first), so a saved
+  # entry is itself proof the widget owns a slot, and holding it is never wrong.
+  #
+  # This used to require a recorded height, on the reasoning that a widget yet to render
+  # holds nothing. But the entries that condition actually excluded were the ones written
+  # before heights were recorded at all, plus everything carried through shift from such a
+  # slice, and those belong to long-standing widgets holding real slots. Skipping them
+  # left holes exactly where the layout was oldest and most settled: a re-pack that
+  # caught those widgets mid-refresh packed straight over them, and because they were
+  # never in the box list their own saved positions stayed put, so the overlap persisted.
+  # Column 1 came back with the three top-lists sitting on cpu, memory and storage.
+  #
+  # UNIT is the floor pack applies to any measured height anyway, so it is also the
+  # smallest slot a widget can occupy, which makes it the safe assumption when the real
+  # height is unknown.
+  for key, p of (@saved ? {}) when not filled[key] and not @savedIsOffGrid(key)
     span = Math.max 1, (p.span ? 1)
     out.push
       key:    key
       col:    @columnOf(p.left, span)
       span:   span
       top:    p.top
-      height: p.height
+      height: Math.max @grid.unit, (p.height ? 0)
       anchor: @anchorOf(key)
   out
 
@@ -957,21 +987,46 @@ watchForResize: ->
 # Column 2 landing as stocks, news, weather is exactly that, and it is why nothing here
 # re-packs on a widget appearing.
 #
-# Settled means the count came back the same twice running. A widget that never renders
-# at all cannot be waited for, so it is packed around, which is the one case this does
-# not cover.
+# Settled means two things, because either alone has been seen to fire early:
+#
+#   - the same widgets came back twice running, compared as a SET and not as a count.
+#     A count cannot tell a desktop that has finished filling in from one where a widget
+#     dropped out of a refresh just as another arrived, and two ticks either side of that
+#     read as identical.
+#   - as many widgets are rendering as this screen holds positions for. A cold start can
+#     easily plateau for the two ticks above with most of the desktop still missing, and
+#     a count that is merely stable is then stable at the wrong number.
+#
+# A widget that never renders at all cannot be waited for: music hides itself whenever
+# nothing is playing, and one switched off for good is never coming back. So the roster
+# check gives up after `limit` ticks and packs with whatever is there. That is safe now
+# only because every saved position is ghosted (see boxes): an absent widget still holds
+# its slot and still contributes its saved top to its column's order, so a pack run
+# early is no longer a pack that reorders anything.
 reflowWhenSettled: (prev) ->
   clearTimeout @_settleTimer
-  last = -1
+  last  = null
+  ticks = 0
+  limit = 12   # ~15s, comfortably past a cold start
   tick = =>
-    now = @widgetEls().length
-    if now > 0 and now is last
+    ids = (@keyOf(el) for el in @widgetEls()).sort()
+    sig = ids.join '\n'
+    ticks += 1
+    stable = ids.length > 0 and sig is last
+    whole  = ids.length >= @expectedRoster().length
+    if ids.length > 0 and ((stable and whole) or ticks >= limit)
       @reflow prev
     else
-      last = now
+      last = sig
       @_settleTimer = setTimeout tick, 1200
   @_settleTimer = setTimeout tick, 1200
   return
+
+# The widgets this screen expects to be showing: everything it holds a position for,
+# minus anything that opts out of management. Taken from the saved positions rather than
+# from `seen`, which also lists the control surfaces and any widget that places itself.
+expectedRoster: ->
+  (key for key of (@saved ? {}) when not @savedIsOffGrid(key))
 
 # --- new widgets -------------------------------------------------------------
 
